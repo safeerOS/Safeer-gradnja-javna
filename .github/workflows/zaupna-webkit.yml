@@ -28,6 +28,11 @@ on:
         default: true
 permissions:
   contents: read
+# Posli tecejo v vsebniku, kjer je privzeta lupina sh (dash): korak za sifriranje dnevnikov z bash tabelo je 15. 11. 2026 padel s
+# »Syntax error: ( unexpected« in sifriranega dnevnika ni nastalo. Vsi koraki so napisani za bash.
+defaults:
+  run:
+    shell: bash
 concurrency:
   group: zaupna-webkit
   cancel-in-progress: false
