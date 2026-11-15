@@ -52,9 +52,13 @@ jobs:
         env:
           ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
         run: |
-          mkdir -p "$RUNNER_TEMP/prekrivalo"
-          python3 tools/zaupno.py razpakiraj zaupno/prekrivalo.tar.gpg "$RUNNER_TEMP/prekrivalo" --dovoli packaging/
-          rm -rf "$RUNNER_TEMP/prekrivalo"
+          python3 tools/zaupno.py razpakiraj zaupno/prekrivalo.tar.gpg . --dovoli packaging/
+          # javno drevo + prekrivalo = celoten gradbeni komplet: manifest popravkov mora ustrezati datotekam (imena ostanejo v tekacu)
+          (cd packaging && sha256sum -c --strict --quiet popravki.sha256 > /dev/null 2>&1) || { echo "::error::manifest popravkov ne ustreza datotekam"; exit 1; }
+          for f in packaging/VERSION packaging/webkit-deb/zgradi.sh packaging/webkit-deb/paket.sh packaging/deb_razlicica.sh tools/preveri_utrjenost.sh; do
+            [ -f "$f" ] || { echo "::error::v gradbenem kompletu manjka datoteka"; exit 1; }
+          done
+          echo "komplet je sestavljen: razlicica $(cat packaging/VERSION)"
       - name: Izhodni artefakt je za tekaca nepreberen (negativna kontrola, »No secret key«)
         env:
           ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
@@ -216,6 +220,10 @@ jobs:
           grep -q '^bolt: da (llvm-bolt 22\.' gradnja.txt
           if grep -q 'brez BOLT' gradnja.txt; then echo "::error::knjiznica brez BOLT"; exit 1; fi
           grep -qx 'predpona: /usr/lib/safeer-webkit' gradnja.txt
+          # vsak popravek iz manifesta je v gradnji uporabljen z ISTO sha256 (imena ostanejo v tekacu)
+          while read -r h f; do
+            grep -q "^popravek: $(basename "$f") $h" gradnja.txt || { echo "::error::popravek iz manifesta ni v gradnja.txt z isto sha256"; exit 1; }
+          done < packaging/popravki.sha256
       - name: Paket safeer-webkit in preverbe utrjenosti
         run: |
           bash packaging/webkit-deb/knjiznice.sh > knjiznice.log 2>&1 || { echo "::error::knjiznice.sh ni uspel (dnevnik je v sifriranem artefaktu)"; exit 1; }
