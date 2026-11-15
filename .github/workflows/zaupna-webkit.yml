@@ -49,7 +49,7 @@ jobs:
       - name: Preizkusi orodja (kljuci so samo preizkusni)
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends gnupg python3-pytest
+          sudo apt-get install -y -q --no-install-recommends gnupg python3-pytest python3-yaml
           python3 -m pytest -q -p no:cacheprovider tests/test_zaupno.py
       - name: Prekrivalo se odsifrira (pozitivna kontrola, skrivnost je pravi kljuc A)
         env:

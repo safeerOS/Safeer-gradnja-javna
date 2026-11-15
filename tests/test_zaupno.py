@@ -249,9 +249,30 @@ def test_bomba_stiskanja_se_ustavi_pri_meji_izhoda(tmp_path, kljuc, monkeypatch)
     izhod = tmp_path / "bomba.tar.gpg"
     _surovo_sifrirano(domov, odtis, [("packaging/nic.bin", bytes(3_000_000), "datoteka")], izhod)
     assert izhod.stat().st_size < 100_000                           # res je stisnjeno (3 MB ničel)
-    with pytest.raises(zaupno.NapakaZaupno):
+    with pytest.raises(zaupno.NapakaZaupno, match="odsifriranje ni uspelo"):    # vzrok je meja gpg, ne razclenitev tara
         zaupno.razpakiraj(izhod, tmp_path / "cilj", kljuc=zasebni)
     assert not (tmp_path / "cilj" / "packaging").exists()
+    # pozitivna kontrola (QQ6): ista datoteka brez nizke meje se razpakira, torej je zavrnitev res zaradi meje
+    monkeypatch.setattr(zaupno, "NAJVEC_IZHODA_GPG", 10_000_000)
+    assert zaupno.razpakiraj(izhod, tmp_path / "cilj2", kljuc=zasebni) == 1
+    assert (tmp_path / "cilj2" / "packaging" / "nic.bin").stat().st_size == 3_000_000
+
+
+def test_lokalno_odsifriranje_ima_tesno_mejo_izhoda(tmp_path, kljuc):
+    """QQ3/RR5: izhod brez stiskanja ni vecji od sifrirane datoteke; stiskalna bomba se ustavi in ne pusti delnega izhoda."""
+    domov, odtis, zasebni, _ = kljuc
+    bomba = tmp_path / "bomba.gpg"
+    _surovo_sifrirano(domov, odtis, [("packaging/nic.bin", bytes(3_000_000), "datoteka")], bomba)
+    with pytest.raises(zaupno.NapakaZaupno):
+        zaupno.odsifriraj(bomba, tmp_path / "ven.bin", domov=domov)
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("ven") or p.name.startswith(".odsifrirano")] == []
+    # pozitivna kontrola: zakonit izhod (nasa sifriraj, brez stiskanja) se odsifrira v celoti
+    podatki = os.urandom(3_000_000)
+    (tmp_path / "izhod.bin").write_bytes(podatki)
+    zaupno.sifriraj(tmp_path / "izhod.bin", tmp_path / "izhod.gpg", odtis, domov=domov)
+    zaupno.odsifriraj(tmp_path / "izhod.gpg", tmp_path / "nazaj.bin", domov=domov)
+    assert (tmp_path / "nazaj.bin").read_bytes() == podatki
+    assert oct((tmp_path / "nazaj.bin").stat().st_mode & 0o777) == "0o600"
 
 
 def test_gpg_tece_v_c_lokali_ne_glede_na_jezik_sistema(monkeypatch):
@@ -265,6 +286,7 @@ def test_gpg_tece_v_c_lokali_ne_glede_na_jezik_sistema(monkeypatch):
     monkeypatch.setenv("LANG", "sl_SI.UTF-8")
     monkeypatch.setenv("LC_ALL", "sl_SI.UTF-8")
     monkeypatch.setenv("LANGUAGE", "sl")
+    monkeypatch.setenv("ZAUPNO_KLJUC", "ne-sme-do-gpg")                # brez te nastavitve je spodnja trditev prazna (QQ7)
     monkeypatch.setattr(zaupno.subprocess, "run", lazni_zagon)
     zaupno._gpg(["--version"], None)
     assert videno["LC_ALL"] == "C"
@@ -280,34 +302,61 @@ def test_predpona_brez_poslevnice_ne_dovoli_sorodne_mape():
 
 # --- delovni tok GitHub Actions (PP1/PP9/PP10, slepi pregled 15. 11. 2026): skrivnost samo tam, kjer jo smemo uporabiti ---
 
+def _yaml():
+    try:
+        import yaml
+    except ImportError:
+        if os.environ.get("GITHUB_ACTIONS"):
+            pytest.fail("v CI mora biti PyYAML (apt: python3-yaml), sicer se preverba toka tiho preskoci")
+        pytest.skip("PyYAML ni nameščen")
+    return yaml
+
+
 def _tezave_toka(besedilo: str) -> list:
-    """Vsak posel, ki bere secrets.ZAUPNO_KLJUC: mora imeti environment, skrivnost samo v env koraka (ne posla),
-    pogoj if pa mora zahtevati lastnika tudi pri ponovnem zagonu (triggering_actor)."""
-    yaml = pytest.importorskip("yaml")
+    """Pravila toka (PP1/PP9/PP10, RR6): sprozilec samo workflow_dispatch; vsak posel ima isti pogoj (privzeta veja, lastnik,
+    triggering_actor); posel, ki vidi skrivnost, ima environment natanko `zaupno`; skrivnost samo v `env` koraka z `run`
+    (ne v poslu, ne v toku, ne v `with`, ne v koraku `uses`), ta korak ne dela se drugih stvari; brez `secrets: inherit`."""
+    yaml = _yaml()
     tok = yaml.safe_load(besedilo)
     tezave = []
+    sproziloci = tok.get("on", tok.get(True))
+    if set(sproziloci if isinstance(sproziloci, (dict, list)) else [sproziloci]) != {"workflow_dispatch"}:
+        tezave.append("tok: sprozilec ni samo workflow_dispatch")
+    if "secrets" in yaml.safe_dump(tok.get("env", {})):
+        tezave.append("tok: skrivnost v env toka")
+    if "toJSON(secrets" in besedilo or "secrets: inherit" in besedilo:
+        tezave.append("tok: toJSON(secrets) ali secrets: inherit")
     for ime, posel in tok["jobs"].items():
-        koraki = posel.get("steps", [])
-        rabi = "ZAUPNO_KLJUC" in yaml.safe_dump(posel)
-        if not rabi:
+        pogoj = str(posel.get("if", ""))
+        if "triggering_actor" not in pogoj or "default_branch" not in pogoj:
+            tezave.append("%s: pogoj brez triggering_actor ali privzete veje" % ime)
+        if "uses" in posel:
+            tezave.append("%s: posel kliče zunanji tok" % ime)
+        if "ZAUPNO_KLJUC" not in yaml.safe_dump(posel):
             continue
         if not posel.get("environment"):
             tezave.append("%s: brez environment" % ime)
+        elif posel.get("environment") != "zaupno":
+            tezave.append("%s: environment ni zaupno" % ime)
         if "ZAUPNO_KLJUC" in yaml.safe_dump(posel.get("env", {})):
             tezave.append("%s: skrivnost v env posla" % ime)
-        if "triggering_actor" not in str(posel.get("if", "")):
-            tezave.append("%s: pogoj brez triggering_actor" % ime)
-        for k in koraki:
-            if "run" in k and "ZAUPNO_KLJUC" in str(k.get("env", {})) and ("sha256sum" in k["run"] or "cat " in k["run"]):
+        for k in posel.get("steps", []):
+            if "ZAUPNO_KLJUC" not in yaml.safe_dump(k):
+                continue
+            if "run" not in k or "uses" in k or "ZAUPNO_KLJUC" in yaml.safe_dump(k.get("with", {})):
+                tezave.append("%s: skrivnost v koraku brez run ali v with" % ime)
+            elif "sha256sum" in k["run"] or "cat " in k["run"]:
                 tezave.append("%s: korak s skrivnostjo dela se druge stvari" % ime)
     return tezave
 
 
 _DOBER = """
+on:
+  workflow_dispatch:
 jobs:
   a:
     environment: zaupno
-    if: ${{ github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     steps:
       - run: python3 tools/zaupno.py razpakiraj x y
         env:
@@ -318,9 +367,17 @@ jobs:
 def test_tok_preverba_ujame_napake():
     assert _tezave_toka(_DOBER) == []
     assert _tezave_toka(_DOBER.replace("    environment: zaupno\n", "")) == ["a: brez environment"]
-    assert _tezave_toka(_DOBER.replace(" && github.triggering_actor == github.repository_owner", "")) == ["a: pogoj brez triggering_actor"]
+    assert _tezave_toka(_DOBER.replace("environment: zaupno", "environment: drugo")) == ["a: environment ni zaupno"]
+    assert _tezave_toka(_DOBER.replace(" && github.triggering_actor == github.repository_owner", "")) == [
+        "a: pogoj brez triggering_actor ali privzete veje"]
     assert _tezave_toka(_DOBER.replace("      - run: python3 tools/zaupno.py razpakiraj x y", "      - run: sha256sum -c a")) == [
         "a: korak s skrivnostjo dela se druge stvari"]
+    assert _tezave_toka(_DOBER.replace("      - run: python3 tools/zaupno.py razpakiraj x y", "      - uses: tuja/akcija@v1")) == [
+        "a: skrivnost v koraku brez run ali v with"]
+    assert _tezave_toka(_DOBER.replace("  workflow_dispatch:", "  workflow_dispatch:\n  pull_request_target:")) == [
+        "tok: sprozilec ni samo workflow_dispatch"]
+    assert _tezave_toka(_DOBER.replace("on:\n", "env:\n  X: ${{ secrets.ZAUPNO_KLJUC }}\non:\n")) == ["tok: skrivnost v env toka"]
+    assert _tezave_toka(_DOBER + "  b:\n    steps:\n      - run: echo\n") == ["b: pogoj brez triggering_actor ali privzete veje"]
 
 
 def test_pravi_tok_je_v_redu():

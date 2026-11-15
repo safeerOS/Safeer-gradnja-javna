@@ -196,10 +196,28 @@ def sifriraj(vhod: Path, izhod: Path, prejemnik: str, domov: str | None = None) 
         raise NapakaZaupno("gpg --encrypt ni uspel (koda %d)" % r.returncode)
 
 
+#: Lokalno odsifriranje izhodov (lastnik): izhod gradnje je lahko velik (paket WebKit), a meja ustavi stiskalno bombo,
+#: ki bi jo tekac s kodo gradnje lahko podtaknil (QQ3, slepi pregled 15. 11. 2026).
+NAJVEC_IZHODA_LOKALNO = 8 * 1024 * 1024 * 1024
+REZERVA_ODSIFRIRANJA = 1024 * 1024
+
+
 def odsifriraj(vhod: Path, izhod: Path, domov: str | None = None) -> None:
-    r = _gpg(["-o", str(izhod), "--decrypt", "--", str(vhod)], domov)
-    if r.returncode != 0:
-        raise NapakaZaupno("gpg --decrypt ni uspel (koda %d)" % r.returncode)
+    """Lokalno odsifriranje izhoda gradnje. Izhode sifriramo brez stiskanja (`--compress-algo none`), zato zakonit izhod ni
+    vecji od sifrirane datoteke (+ majhna rezerva): meja je torej tesna in stiskalna bomba (RR5) se ustavi takoj.
+    Piše se v zacasno datoteko v isti mapi (0600), na cilj sele po uspehu; ob napaki ne ostane nic (tudi ne delni izhod)."""
+    vhod, izhod = Path(vhod), Path(izhod)
+    meja = min(NAJVEC_IZHODA_LOKALNO, vhod.stat().st_size + REZERVA_ODSIFRIRANJA)
+    fd, zacasna = tempfile.mkstemp(prefix=".odsifrirano-", dir=str(izhod.resolve().parent))
+    os.close(fd)
+    try:
+        r = _gpg(["-o", zacasna, "--max-output", str(meja), "--decrypt", "--", str(vhod)], domov)
+        if r.returncode != 0:
+            raise NapakaZaupno("gpg --decrypt ni uspel (koda %d)" % r.returncode)
+        os.replace(zacasna, izhod)
+    finally:
+        if os.path.lexists(zacasna):
+            os.unlink(zacasna)
 
 
 def main(argv: list[str] | None = None) -> int:
