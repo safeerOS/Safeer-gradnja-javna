@@ -165,3 +165,78 @@ def test_cli_brez_kljuca_vrne_2_in_napisi_napako(tmp_path):
     r = subprocess.run([sys.executable, str(Path(zaupno.__file__)), "razpakiraj", str(tmp_path / "ni"), str(tmp_path / "c")],
                        capture_output=True, env={k: v for k, v in os.environ.items() if k != "ZAUPNO_KLJUC"})
     assert r.returncode == 2 and b"ZAUPNO_KLJUC" in r.stderr
+
+
+def test_povezava_znotraj_cilja_na_kodo_ki_tece_pozneje_je_zavrnjena(tmp_path, kljuc):
+    """MM3: packaging/x -> ../tools/z.py je znotraj cilja, zato resolve() ni ujel prepisa tools/z.py."""
+    domov, odtis, zasebni, _ = kljuc
+    izhod = tmp_path / "z.gpg"
+    _surovo_sifrirano(domov, odtis, [("packaging/x", b"zlo", "datoteka")], izhod)
+    cilj = tmp_path / "cilj"
+    (cilj / "tools").mkdir(parents=True)
+    (cilj / "packaging").mkdir()
+    (cilj / "tools" / "z.py").write_text("izvirnik")
+    os.symlink("../tools/z.py", cilj / "packaging" / "x")
+    with pytest.raises(zaupno.NapakaZaupno):
+        zaupno.razpakiraj(izhod, cilj, kljuc=zasebni)
+    assert (cilj / "tools" / "z.py").read_text() == "izvirnik"
+
+
+def test_povezava_na_mapo_na_poti_je_zavrnjena(tmp_path, kljuc):
+    domov, odtis, zasebni, _ = kljuc
+    izhod = tmp_path / "z.gpg"
+    _surovo_sifrirano(domov, odtis, [("packaging/webkit-deb/zagon.sh", b"zlo", "datoteka")], izhod)
+    cilj = tmp_path / "cilj"
+    (cilj / "tools").mkdir(parents=True)
+    (cilj / "packaging").mkdir()
+    os.symlink("../tools", cilj / "packaging" / "webkit-deb")
+    with pytest.raises(zaupno.NapakaZaupno):
+        zaupno.razpakiraj(izhod, cilj, kljuc=zasebni)
+    assert not (cilj / "tools" / "zagon.sh").exists()
+
+
+def test_napaka_ne_izpise_imena_clena(tmp_path, kljuc):
+    """MM4: imena poti neobjavljenega dela ne smejo v javni dnevnik."""
+    domov, odtis, zasebni, _ = kljuc
+    izhod = tmp_path / "z.gpg"
+    _surovo_sifrirano(domov, odtis, [("packaging/dober.txt", b"ok", "datoteka"), ("tajno/ime.c", b"zlo", "datoteka")], izhod)
+    with pytest.raises(zaupno.NapakaZaupno) as e:
+        zaupno.razpakiraj(izhod, tmp_path / "cilj", kljuc=zasebni)
+    assert "tajno" not in str(e.value) and "ime.c" not in str(e.value)
+    r = subprocess.run([sys.executable, str(Path(zaupno.__file__)), "razpakiraj", str(izhod), str(tmp_path / "c2")],
+                       capture_output=True, env=dict(os.environ, ZAUPNO_KLJUC=zasebni), check=False)
+    assert r.returncode == 2
+    assert b"tajno" not in r.stdout + r.stderr and b"ime.c" not in r.stdout + r.stderr
+
+
+def test_pakiraj_ne_sledi_povezavam_na_mape(tmp_path, kljuc):
+    """MM11: stage/povezava -> mapa zunaj ne sme spraviti tujih datotek v prekrivalo ali izhod."""
+    domov, odtis, zasebni, _ = kljuc
+    zunaj = tmp_path / "zunaj"
+    zunaj.mkdir()
+    (zunaj / "skrivnost.txt").write_text("tuje")
+    vir = tmp_path / "vir"
+    (vir / "packaging").mkdir(parents=True)
+    (vir / "packaging" / "a").write_text("x")
+    os.symlink(zunaj, vir / "packaging" / "povezava")
+    izhod = tmp_path / "p.gpg"
+    assert zaupno.pakiraj(vir, izhod, odtis, domov=domov) == 1
+    cilj = tmp_path / "cilj"
+    zaupno.razpakiraj(izhod, cilj, kljuc=zasebni)
+    assert not (cilj / "packaging" / "povezava").exists()
+
+
+def test_nepreberno_loci_berljiv_izhod_od_nepreberljivega(tmp_path, kljuc, drug_kljuc):
+    """MM2: izhod za LOCEN par je s kljucem iz okolja nepreberen (No secret key); za isti par je berljiv."""
+    domov, odtis, zasebni, _ = kljuc
+    drug_domov, drug_odtis, drug_zasebni, _ = drug_kljuc
+    dat = tmp_path / "a.bin"
+    dat.write_bytes(b"izhod")
+    za_drugega = tmp_path / "a.gpg"
+    zaupno.sifriraj(dat, za_drugega, drug_odtis, domov=drug_domov)
+    assert zaupno.nepreberno(za_drugega, kljuc=zasebni) is True
+    za_istega = tmp_path / "b.gpg"
+    zaupno.sifriraj(dat, za_istega, odtis, domov=domov)
+    assert zaupno.nepreberno(za_istega, kljuc=zasebni) is False
+    (tmp_path / "c.gpg").write_bytes(b"to ni gpg")
+    assert zaupno.nepreberno(tmp_path / "c.gpg", kljuc=zasebni) is False      # drug vzrok ni dokaz

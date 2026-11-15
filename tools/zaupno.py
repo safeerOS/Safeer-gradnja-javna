@@ -50,18 +50,42 @@ def _gpg(args: list[str], domov: str | None, vhod: bytes | None = None) -> subpr
 def _varna_pot(ime: str, predpone: tuple[str, ...]) -> str:
     p = PurePosixPath(ime)
     if p.is_absolute() or ".." in p.parts or ime.startswith(("/", "\\")) or "\\" in ime or "\x00" in ime:
-        raise NapakaZaupno("nevarna pot v prekrivalu: %r" % ime)
+        raise NapakaZaupno("nevarna pot v prekrivalu")
     s = p.as_posix()
     if s in ("", "."):
         raise NapakaZaupno("prazna pot v prekrivalu")
     if not any(s.startswith(pr) for pr in predpone):
-        raise NapakaZaupno("pot zunaj dovoljenih predpon: %r" % ime)
+        raise NapakaZaupno("pot zunaj dovoljenih predpon")
     return s
+
+
+def _brez_povezav(cilj: Path, rel: str) -> Path:
+    """Pot v ciljni mapi, v kateri NI nobene simbolne povezave (MM3, neodvisni pregled 15. 11. 2026): resolve() bi povezavo
+    v ze obstojecem drevesu razresil znotraj cilja (packaging/x -> ../tools/zaupno.py) in prekrivalo bi prepisalo kodo,
+    ki tece pozneje v koraku s skrivnostjo. Vsak obstojeci del poti mora biti navadna mapa ali (zadnji) navadna datoteka."""
+    p = cilj
+    deli = PurePosixPath(rel).parts
+    for i, del_ in enumerate(deli):
+        p = p / del_
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            raise NapakaZaupno("simbolna povezava na poti v ciljni mapi")
+        zadnji = i == len(deli) - 1
+        if (zadnji and not stat.S_ISREG(st.st_mode)) or (not zadnji and not stat.S_ISDIR(st.st_mode)):
+            raise NapakaZaupno("nepricakovana vrsta obstojece datoteke v ciljni mapi")
+    return p
 
 
 def pakiraj(mapa: Path, izhod: Path, prejemnik: str, domov: str | None = None) -> int:
     mapa = Path(mapa)
-    datoteke = sorted(p for p in mapa.rglob("*") if p.is_file() and not p.is_symlink())
+    datoteke = []
+    for koren, mape, imena in os.walk(mapa, followlinks=False):      # MM11: povezave na mape se ne obiscejo
+        mape[:] = [d for d in mape if not os.path.islink(os.path.join(koren, d))]
+        datoteke += [Path(koren, n) for n in imena if not os.path.islink(os.path.join(koren, n))]
+    datoteke.sort()
     if not datoteke:
         raise NapakaZaupno("mapa nima datotek")
     pomnilnik = io.BytesIO()
@@ -78,7 +102,7 @@ def pakiraj(mapa: Path, izhod: Path, prejemnik: str, domov: str | None = None) -
     r = _gpg(["--trust-model", "always", "--compress-algo", "none", "-r", prejemnik, "-o", str(izhod), "--encrypt"],
              domov, pomnilnik.getvalue())
     if r.returncode != 0:
-        raise NapakaZaupno("gpg --encrypt: " + r.stderr.decode("utf-8", "replace")[:300])
+        raise NapakaZaupno("gpg --encrypt ni uspel (koda %d)" % r.returncode)
     return len(datoteke)
 
 
@@ -95,6 +119,11 @@ def _odsifriraj_tok(vhod: Path, kljuc: str) -> bytes:
             raise NapakaZaupno("odsifriranje ni uspelo (napacen kljuc ali pokvarjena datoteka)")
         return r.stdout
     finally:
+        try:      # MM6: agent bi sicer zivel dalje (kljuc brez gesla), ko gradnja ze tece kot root
+            subprocess.run(["gpgconf", "--homedir", domov, "--kill", "all"], capture_output=True, check=False, timeout=15,
+                           env={k: v for k, v in os.environ.items() if k != "ZAUPNO_KLJUC"})
+        except (OSError, subprocess.SubprocessError):
+            pass
         shutil.rmtree(domov, ignore_errors=True)
 
 
@@ -114,38 +143,58 @@ def razpakiraj(vhod: Path, cilj: Path, predpone: tuple[str, ...] = PRIVZETE_PRED
             if c.isdir():
                 continue
             if not c.isreg():
-                raise NapakaZaupno("nedovoljena vrsta clena (povezava ali naprava): %r" % c.name)
+                raise NapakaZaupno("nedovoljena vrsta clena (povezava ali naprava)")
             skupaj += c.size
             if skupaj > NAJVEC_BAJTOV:
                 raise NapakaZaupno("prekrivalo je preveliko")
             rel = _varna_pot(c.name, predpone)
-            ciljna = (cilj / rel).resolve()
-            if cilj not in ciljna.parents:
-                raise NapakaZaupno("pot uide iz ciljne mape: %r" % c.name)
+            ciljna = _brez_povezav(cilj, rel)
             nacrt.append((c, ciljna))
         for c, ciljna in nacrt:                       # sele po preverbi VSEH clenov se kaj zapise
             ciljna.parent.mkdir(parents=True, exist_ok=True)
-            if ciljna.is_symlink():
-                ciljna.unlink()
             f = tar.extractfile(c)
             assert f is not None
-            with open(ciljna, "wb") as g:
+            # O_NOFOLLOW: tudi ce se povezava pojavi med preverbo in zapisom, se ne sledi (MM3)
+            fd = os.open(ciljna, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "wb") as g:
                 shutil.copyfileobj(f, g)
             os.chmod(ciljna, 0o755 if c.mode & stat.S_IXUSR else 0o644)
     return len(nacrt)
+
+
+def nepreberno(vhod: Path, kljuc: str | None = None) -> bool:
+    """MM2: dokaz, da kljuc iz okolja (ZAUPNO_KLJUC) izhoda NE odsifrira, in da je vzrok res manjkajoci zasebni kljuc
+    (»No secret key«), ne okvara gpg. Izhodi se sifrirajo za LOCEN par, katerega zasebni del ni v Actions."""
+    kljuc = kljuc if kljuc is not None else os.environ.get("ZAUPNO_KLJUC", "")
+    if not kljuc.strip():
+        raise NapakaZaupno("ZAUPNO_KLJUC ni nastavljen")
+    osnova = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+    domov = tempfile.mkdtemp(prefix="zaupno-", dir=osnova)
+    try:
+        if _gpg(["--import"], domov, kljuc.encode("utf-8")).returncode != 0:
+            raise NapakaZaupno("uvoz kljuca ni uspel")
+        r = _gpg(["--decrypt", str(vhod)], domov)
+        return r.returncode != 0 and b"No secret key" in r.stderr and not r.stdout
+    finally:
+        try:
+            subprocess.run(["gpgconf", "--homedir", domov, "--kill", "all"], capture_output=True, check=False, timeout=15,
+                           env={k: v for k, v in os.environ.items() if k != "ZAUPNO_KLJUC"})
+        except (OSError, subprocess.SubprocessError):
+            pass
+        shutil.rmtree(domov, ignore_errors=True)
 
 
 def sifriraj(vhod: Path, izhod: Path, prejemnik: str, domov: str | None = None) -> None:
     r = _gpg(["--trust-model", "always", "--compress-algo", "none", "-r", prejemnik, "-o", str(izhod),
               "--encrypt", str(vhod)], domov)
     if r.returncode != 0:
-        raise NapakaZaupno("gpg --encrypt: " + r.stderr.decode("utf-8", "replace")[:300])
+        raise NapakaZaupno("gpg --encrypt ni uspel (koda %d)" % r.returncode)
 
 
 def odsifriraj(vhod: Path, izhod: Path, domov: str | None = None) -> None:
     r = _gpg(["-o", str(izhod), "--decrypt", str(vhod)], domov)
     if r.returncode != 0:
-        raise NapakaZaupno("gpg --decrypt: " + r.stderr.decode("utf-8", "replace")[:300])
+        raise NapakaZaupno("gpg --decrypt ni uspel (koda %d)" % r.returncode)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -156,18 +205,26 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--dovoli", nargs="+", default=list(PRIVZETE_PREDPONE))
     c = sp.add_parser("sifriraj"); c.add_argument("vhod"); c.add_argument("izhod"); c.add_argument("prejemnik")
     d = sp.add_parser("odsifriraj"); d.add_argument("vhod"); d.add_argument("izhod")
+    e = sp.add_parser("nepreberno"); e.add_argument("vhod")
     n = ap.parse_args(argv)
     try:
         if n.ukaz == "pakiraj":
             print("zapakiranih datotek: %d" % pakiraj(Path(n.mapa), Path(n.izhod), n.prejemnik))
         elif n.ukaz == "razpakiraj":
             print("razpakiranih datotek: %d" % razpakiraj(Path(n.vhod), Path(n.cilj), tuple(n.dovoli)))
+        elif n.ukaz == "nepreberno":
+            if not nepreberno(Path(n.vhod)):
+                raise NapakaZaupno("izhod je berljiv s kljucem iz okolja ali vzrok ni manjkajoci zasebni kljuc")
+            print("izhod je nepreberen s kljucem iz okolja")
         elif n.ukaz == "sifriraj":
             sifriraj(Path(n.vhod), Path(n.izhod), n.prejemnik)
         else:
             odsifriraj(Path(n.vhod), Path(n.izhod))
     except NapakaZaupno as e:
         print("NAPAKA: %s" % e, file=sys.stderr)
+        return 2
+    except Exception as e:  # noqa: BLE001 - javni dnevnik: samo vrsta napake, brez poti in imen (MM4)
+        print("NAPAKA: nepricakovana napaka (%s)" % type(e).__name__, file=sys.stderr)
         return 2
     return 0
 
