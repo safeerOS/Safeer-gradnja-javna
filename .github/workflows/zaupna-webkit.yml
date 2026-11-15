@@ -1,0 +1,215 @@
+name: Zaupna gradnja WebKita
+# Javni repozitorij, neobjavljeno delo SAMO sifrirano (lastnik, 15. 11. 2026): zaupno/prekrivalo.tar.gpg vsebuje
+# datoteke, ki se niso javne. Tekac jih odsifrira z zasebnim kljucem iz skrivnosti
+# ZAUPNO_KLJUC, gradi, vse izhode (profil PGO, arhiv, paket, dnevnik) pa SIFRIRA z javnim kljucem (zaupno/kljuc.pub.asc):
+# tekac jih ne more prebrati nazaj, prebere jih samo lastnik (tools/zaupno.py odsifriraj).
+# Pravila, ki jih ta tok drzi (ne spreminjaj brez neodvisnega pregleda):
+#  - samo rocni zagon (workflow_dispatch) s privzete veje; nikoli push, pull_request, oznaka ali urnik;
+#  - skrivnost je samo v korakih, ki jo potrebujejo (env na koraku, ne na poslu); koraki gradnje je ne dobijo;
+#  - dnevnik javnega teka vsebuje samo stevce in izide: celoten izpis gradnje gre v sifriran artefakt (vsaka
+#    napaka prevajalca bi sicer izpisala vrstico izvorne kode prekrivala);
+#  - brez actions/cache za karkoli iz prekrivanega izvora (predpomnilnik bi bil berljiv); artefakti samo sifrirani;
+#  - v repozitoriju mora biti nastavljeno »Require approval for all outside collaborators« za tuje zahteve.
+on:
+  workflow_dispatch:
+    inputs:
+      samo_preizkus:
+        description: 'Samo preizkus mehanizma (odsifrira prekrivalo, sifrira poskusni artefakt); WebKita ne gradi'
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: zaupna-webkit
+  cancel-in-progress: false
+env:
+  ZAUPNO_PREJEMNIK: 65D409023A7BBCFD7F39C9908D5DBA8A56C45183
+  DEBIAN_FRONTEND: noninteractive
+  TZ: UTC
+jobs:
+  preizkus-mehanizma:
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Preizkusi orodja (kljuci so samo preizkusni)
+        run: |
+          sudo apt-get install -y -q --no-install-recommends gnupg python3-pytest
+          python3 -m pytest -q -p no:cacheprovider tests/test_zaupno.py
+      - name: Prekrivalo se odsifrira (izpise se samo stevilo datotek)
+        env:
+          ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/prekrivalo"
+          python3 tools/zaupno.py razpakiraj zaupno/prekrivalo.tar.gpg "$RUNNER_TEMP/prekrivalo" --dovoli packaging/
+          rm -rf "$RUNNER_TEMP/prekrivalo"
+      - name: Izhodni artefakt se sifrira samo z javnim kljucem
+        run: |
+          gpg --batch --quiet --import zaupno/kljuc.pub.asc
+          head -c 4096 /dev/urandom > "$RUNNER_TEMP/poskus.bin"
+          python3 tools/zaupno.py sifriraj "$RUNNER_TEMP/poskus.bin" "$RUNNER_TEMP/poskus.bin.gpg" "$ZAUPNO_PREJEMNIK"
+          if python3 tools/zaupno.py odsifriraj "$RUNNER_TEMP/poskus.bin.gpg" "$RUNNER_TEMP/nazaj.bin"; then
+            echo "::error::tekac je lahko prebral svoj sifriran izhod"; exit 1
+          fi
+          echo "::notice::izhod je sifriran in ga tekac ne more prebrati"
+
+  profil:
+    # PGO 1/2: instrumentiran WebKitGTK + ucni tek; profraw gre sifriran v artefakt (vsebuje imena funkcij prekrivanega izvora).
+    needs: preizkus-mehanizma
+    if: ${{ !inputs.samo_preizkus }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    container:
+      image: ubuntu:24.04
+      options: --privileged
+      volumes:
+        - /usr/share/dotnet:/gostitelj/dotnet
+        - /usr/local/lib/android:/gostitelj/android
+        - /opt/ghc:/gostitelj/ghc
+        - /opt/hostedtoolcache/CodeQL:/gostitelj/codeql
+    steps:
+      - name: Prostor na disku in orodja
+        run: |
+          rm -rf /gostitelj/dotnet/* /gostitelj/android/* /gostitelj/ghc/* /gostitelj/codeql/*
+          df -h /
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends ca-certificates zstd git gnupg python3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Zaupno prekrivalo
+        env:
+          ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
+        run: python3 tools/zaupno.py razpakiraj zaupno/prekrivalo.tar.gpg . --dovoli packaging/
+      - name: Odvisnosti in orodja ucnega teka
+        run: |
+          bash packaging/webkit-deb/odvisnosti.sh > build-odvisnosti.log 2>&1 || { tail -n 5 build-odvisnosti.log | cut -c1-200; exit 1; }
+          apt-get install -y -q --no-install-recommends python3-gi gir1.2-gtk-4.0 xvfb xauth dbus procps
+      - name: Instrumentiran WebKitGTK (Clang 22, ThinLTO, -fprofile-generate)
+        run: bash tools/zaupno_zagon.sh build/dnevnik-profil.txt env SAFEER_WEBKIT_PGO=ucenje bash packaging/webkit-deb/zgradi.sh /usr/lib/safeer-webkit
+      - name: Ucni tek (Speedometer 3.1, pripeta kopija)
+        run: bash tools/zaupno_zagon.sh build/dnevnik-ucenje.txt bash packaging/webkit-deb/ucni_tek.sh /usr/lib/safeer-webkit build/pgo/profraw
+      - name: Profil in dnevnika sifrirano v artefakt
+        if: always()
+        run: |
+          gpg --batch --quiet --import zaupno/kljuc.pub.asc
+          test "$(find build/pgo/profraw -name '*.profraw' -size +1k 2>/dev/null | wc -l)" -ge 1 || echo "::warning::ni profila"
+          mkdir -p stage/build/pgo stage/build
+          [ -d build/pgo/profraw ] && cp -r build/pgo/profraw stage/build/pgo/
+          cp build/dnevnik-*.txt stage/build/ 2>/dev/null || true
+          python3 tools/zaupno.py pakiraj stage profil.tar.gpg "$ZAUPNO_PREJEMNIK"
+          ls -l profil.tar.gpg
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: zaupno-profil
+          path: profil.tar.gpg
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 5
+
+  dav1d:
+    needs: preizkus-mehanizma
+    if: ${{ !inputs.samo_preizkus }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Gradnja dekoderja AV1 (isti skript kot v javnem toku; ne vsebuje prekrivala)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libdav1d-dev pkg-config
+          bash packaging/webkit-deb/dav1d.sh build/dav1d
+          grep -q '^gst-plugin-dav1d 0\.14\.5 ' build/dav1d/gradnja.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dav1d-deb
+          path: build/dav1d/
+          retention-days: 3
+
+  webkit:
+    # PGO 2/2: gradnja s profilom in BOLT, paket safeer-webkit; vse sifrirano.
+    needs: [profil, dav1d]
+    if: ${{ !inputs.samo_preizkus }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    container:
+      image: ubuntu:24.04
+      options: --privileged
+      volumes:
+        - /usr/share/dotnet:/gostitelj/dotnet
+        - /usr/local/lib/android:/gostitelj/android
+        - /opt/ghc:/gostitelj/ghc
+        - /opt/hostedtoolcache/CodeQL:/gostitelj/codeql
+    steps:
+      - name: Prostor na disku in orodja
+        run: |
+          rm -rf /gostitelj/dotnet/* /gostitelj/android/* /gostitelj/ghc/* /gostitelj/codeql/*
+          df -h /
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends ca-certificates zstd git gnupg python3
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Zaupno prekrivalo
+        env:
+          ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
+        run: python3 tools/zaupno.py razpakiraj zaupno/prekrivalo.tar.gpg . --dovoli packaging/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: zaupno-profil
+          path: prenos
+      - name: Profil PGO se odsifrira
+        env:
+          ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
+        run: |
+          python3 tools/zaupno.py razpakiraj prenos/profil.tar.gpg . --dovoli build/
+          (cd build/pgo/profraw && sha256sum -- *.profraw > SHA256SUMS && ls -l)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dav1d-deb
+          path: build/dav1d
+      - name: Odvisnosti (Clang 22 in BOLT 22, knjiznice noble)
+        run: |
+          bash packaging/webkit-deb/odvisnosti.sh > build-odvisnosti.log 2>&1 || { tail -n 5 build-odvisnosti.log | cut -c1-200; exit 1; }
+          apt-get install -y -q --no-install-recommends python3-gi gir1.2-gtk-4.0 xvfb xauth dbus procps git gdb
+      - name: WebKitGTK in libsoup (Clang 22, ThinLTO, PGO, BOLT)
+        run: |
+          bash tools/zaupno_zagon.sh build/dnevnik-gradnja.txt env SAFEER_WEBKIT_PGO=uporaba SAFEER_WEBKIT_PROFRAW=build/pgo/profraw SAFEER_WEBKIT_BOLT=1 \
+            bash packaging/webkit-deb/zgradi.sh /usr/lib/safeer-webkit build/safeer-webkit.tar.zst
+      - name: Arhiv je celovit in zapis gradnje je tak, kot mora biti
+        run: |
+          zstd -q -t build/safeer-webkit.tar.zst
+          tar -I zstd -xOf build/safeer-webkit.tar.zst usr/lib/safeer-webkit/share/webkitgtk-safeer/gradnja.txt > gradnja.txt
+          grep -q 'clang version 22\.' gradnja.txt
+          grep -q '^LTO_MODE:.*=thin$' gradnja.txt
+          grep -q '^USE_PGO_PROFILE:BOOL=ON$' gradnja.txt
+          grep -q '^bolt: da (llvm-bolt 22\.' gradnja.txt
+          if grep -q 'brez BOLT' gradnja.txt; then echo "::error::knjiznica brez BOLT"; exit 1; fi
+          grep -qx 'predpona: /usr/lib/safeer-webkit' gradnja.txt
+          echo "::notice::arhiv $(stat -c %s build/safeer-webkit.tar.zst) B"
+      - name: Paket safeer-webkit in preverbe utrjenosti
+        run: |
+          bash packaging/webkit-deb/knjiznice.sh > knjiznice.log 2>&1 || { tail -n 5 knjiznice.log | cut -c1-200; exit 1; }
+          DEB="$(SAFEER_DAV1D=build/dav1d bash packaging/webkit-deb/paket.sh build/safeer-webkit.tar.zst .)"
+          test "$DEB" = "./safeer-webkit_$(cat packaging/VERSION)_amd64.deb"
+          dpkg-deb -f "$DEB" Version | grep -Fx "$(bash packaging/deb_razlicica.sh "$(cat packaging/VERSION)")"
+          X="$(mktemp -d)"; dpkg-deb -x "$DEB" "$X"
+          bash tools/preveri_utrjenost.sh "$X/usr/lib/safeer-webkit" > utrjenost.log 2>&1 && echo "::notice::utrjenost: OK" || { tail -n 8 utrjenost.log | cut -c1-200; exit 1; }
+          rm -rf "$X"
+          echo "$DEB" > deb-ime.txt
+      - name: Izhodi se sifrirajo (samo javni kljuc)
+        if: always()
+        run: |
+          gpg --batch --quiet --import zaupno/kljuc.pub.asc
+          mkdir -p izhod
+          for f in build/safeer-webkit.tar.zst safeer-webkit_*_amd64.deb; do
+            [ -f "$f" ] && python3 tools/zaupno.py sifriraj "$f" "izhod/$(basename "$f").gpg" "$ZAUPNO_PREJEMNIK"
+          done
+          tar -cf - build/dnevnik-*.txt gradnja.txt utrjenost.log knjiznice.log build-odvisnosti.log 2>/dev/null > dnevniki.tar || true
+          [ -s dnevniki.tar ] && python3 tools/zaupno.py sifriraj dnevniki.tar izhod/dnevniki.tar.gpg "$ZAUPNO_PREJEMNIK"
+          (cd izhod && sha256sum -- *.gpg > SHA256SUMS && ls -l)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: zaupno-webkit
+          path: izhod/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
