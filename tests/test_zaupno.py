@@ -276,3 +276,55 @@ def test_predpona_brez_poslevnice_ne_dovoli_sorodne_mape():
     assert zaupno._varna_pot("packaging/a.sh", ("packaging",)) == "packaging/a.sh"
     with pytest.raises(zaupno.NapakaZaupno):
         zaupno._varna_pot("packaging-zlo/a.sh", ("packaging",))
+
+
+# --- delovni tok GitHub Actions (PP1/PP9/PP10, slepi pregled 15. 11. 2026): skrivnost samo tam, kjer jo smemo uporabiti ---
+
+def _tezave_toka(besedilo: str) -> list:
+    """Vsak posel, ki bere secrets.ZAUPNO_KLJUC: mora imeti environment, skrivnost samo v env koraka (ne posla),
+    pogoj if pa mora zahtevati lastnika tudi pri ponovnem zagonu (triggering_actor)."""
+    yaml = pytest.importorskip("yaml")
+    tok = yaml.safe_load(besedilo)
+    tezave = []
+    for ime, posel in tok["jobs"].items():
+        koraki = posel.get("steps", [])
+        rabi = "ZAUPNO_KLJUC" in yaml.safe_dump(posel)
+        if not rabi:
+            continue
+        if not posel.get("environment"):
+            tezave.append("%s: brez environment" % ime)
+        if "ZAUPNO_KLJUC" in yaml.safe_dump(posel.get("env", {})):
+            tezave.append("%s: skrivnost v env posla" % ime)
+        if "triggering_actor" not in str(posel.get("if", "")):
+            tezave.append("%s: pogoj brez triggering_actor" % ime)
+        for k in koraki:
+            if "run" in k and "ZAUPNO_KLJUC" in str(k.get("env", {})) and ("sha256sum" in k["run"] or "cat " in k["run"]):
+                tezave.append("%s: korak s skrivnostjo dela se druge stvari" % ime)
+    return tezave
+
+
+_DOBER = """
+jobs:
+  a:
+    environment: zaupno
+    if: ${{ github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
+    steps:
+      - run: python3 tools/zaupno.py razpakiraj x y
+        env:
+          ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
+"""
+
+
+def test_tok_preverba_ujame_napake():
+    assert _tezave_toka(_DOBER) == []
+    assert _tezave_toka(_DOBER.replace("    environment: zaupno\n", "")) == ["a: brez environment"]
+    assert _tezave_toka(_DOBER.replace(" && github.triggering_actor == github.repository_owner", "")) == ["a: pogoj brez triggering_actor"]
+    assert _tezave_toka(_DOBER.replace("      - run: python3 tools/zaupno.py razpakiraj x y", "      - run: sha256sum -c a")) == [
+        "a: korak s skrivnostjo dela se druge stvari"]
+
+
+def test_pravi_tok_je_v_redu():
+    pot = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "zaupna-webkit.yml"
+    if not pot.is_file():
+        pytest.skip("delovnega toka ni v tem drevesu (je samo v javnem repozitoriju za gradnjo)")
+    assert _tezave_toka(pot.read_text(encoding="utf-8")) == []

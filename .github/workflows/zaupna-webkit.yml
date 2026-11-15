@@ -16,7 +16,9 @@ name: Zaupna gradnja WebKita
 # ZNANO PREOSTALO TVEGANJE (MM1): med gradnjo je odsifrirano prekrivalo in zasebni kljuc A v tekacu, kjer tece tudi koda
 # gradnje (skripte, ki jih prinese prekrivalo, prenosi odvisnosti). Kdor spremeni tako kodo, lahko prebere prekrivalo.
 # Zato: prenosi so pripeti na sha256, spremembe zaupno/ in .github/ gredo samo prek lastnika, skrivnost je v okolju
-# »zaupno«, omejenem na privzeto vejo. Kljuc za izhode (B) na tekacu NI, zato izhodov tudi napadalec ne prebere.
+# »zaupno«, omejenem na privzeto vejo (posli z skrivnostjo imajo `environment: zaupno`). Kljuc za izhode (B) na tekacu NI:
+# napadalec, ki bere dnevnike, artefakte in predpomnilnike, izhodov ne prebere; kdor izvaja kodo v poslu gradnje, pa vidi
+# cistopis pred sifriranjem (PP2) - to je preostalo tveganje in ga lastnik pozna.
 on:
   workflow_dispatch:
     inputs:
@@ -36,7 +38,8 @@ env:
   TZ: UTC
 jobs:
   preizkus-mehanizma:
-    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner }}
+    environment: zaupno
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -53,12 +56,14 @@ jobs:
           ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
         run: |
           python3 tools/zaupno.py razpakiraj zaupno/prekrivalo.tar.gpg . --dovoli packaging/
+      - name: Komplet je sestavljen (brez skrivnosti v okolju)
+        run: |
           # javno drevo + prekrivalo = celoten gradbeni komplet: manifest popravkov mora ustrezati datotekam (imena ostanejo v tekacu)
           (cd packaging && sha256sum -c --strict --quiet popravki.sha256 > /dev/null 2>&1) || { echo "::error::manifest popravkov ne ustreza datotekam"; exit 1; }
           for f in packaging/VERSION packaging/webkit-deb/zgradi.sh packaging/webkit-deb/paket.sh packaging/deb_razlicica.sh tools/preveri_utrjenost.sh; do
             [ -f "$f" ] || { echo "::error::v gradbenem kompletu manjka datoteka"; exit 1; }
           done
-          echo "komplet je sestavljen: razlicica $(cat packaging/VERSION)"
+          echo "komplet je sestavljen"
       - name: Izhodni artefakt je za tekaca nepreberen (negativna kontrola, »No secret key«)
         env:
           ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
@@ -71,8 +76,9 @@ jobs:
 
   profil:
     # PGO 1/2: instrumentiran WebKitGTK + ucni tek; profraw gre sifriran (kljuc A) samo do posla »webkit«.
+    environment: zaupno
     needs: preizkus-mehanizma
-    if: ${{ !inputs.samo_preizkus && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner }}
+    if: ${{ !inputs.samo_preizkus && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
@@ -142,7 +148,7 @@ jobs:
 
   dav1d:
     needs: preizkus-mehanizma
-    if: ${{ !inputs.samo_preizkus && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner }}
+    if: ${{ !inputs.samo_preizkus && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -163,8 +169,9 @@ jobs:
 
   webkit:
     # PGO 2/2: gradnja s profilom in BOLT, paket safeer-webkit; vse izhodi sifrirani za kljuc B.
+    environment: zaupno
     needs: [profil, dav1d]
-    if: ${{ !inputs.samo_preizkus && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner }}
+    if: ${{ !inputs.samo_preizkus && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner }}
     runs-on: ubuntu-24.04
     timeout-minutes: 340
     container:
@@ -195,9 +202,9 @@ jobs:
       - name: Profil PGO se odsifrira (samo pod build/pgo/profraw/)
         env:
           ZAUPNO_KLJUC: ${{ secrets.ZAUPNO_KLJUC }}
-        run: |
-          python3 tools/zaupno.py razpakiraj prenos/profil.tar.gpg . --dovoli build/pgo/profraw/
-          (cd build/pgo/profraw && sha256sum -- *.profraw > SHA256SUMS)
+        run: python3 tools/zaupno.py razpakiraj prenos/profil.tar.gpg . --dovoli build/pgo/profraw/
+      - name: Vsota profila (brez skrivnosti v okolju)
+        run: (cd build/pgo/profraw && sha256sum -- *.profraw > SHA256SUMS)
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dav1d-deb
