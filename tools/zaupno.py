@@ -30,6 +30,8 @@ from pathlib import Path, PurePosixPath
 
 NAJVEC_CLENOV = 5000
 NAJVEC_BAJTOV = 512 * 1024 * 1024
+#: OO5: gpg sam ustavi odsifriranje, ko bi izhod presegel mejo (stisnjen paket bi sicer zapolnil pomnilnik), rezerva za glave tar
+NAJVEC_IZHODA_GPG = NAJVEC_BAJTOV + 8 * 1024 * 1024
 PRIVZETE_PREDPONE = ("packaging/", "tests/")
 
 
@@ -41,6 +43,9 @@ def _gpg(args: list[str], domov: str | None, vhod: bytes | None = None) -> subpr
     # Okolje podprocesu z env= (pravilo: v procesu z nitmi os.environ ne spreminjamo).
     env = dict(os.environ)
     env.pop("ZAUPNO_KLJUC", None)
+    # OO7: sporocila gpg so prevedena po jeziku sistema; presoja po besedilu (»No secret key«) velja samo v C lokali.
+    env["LC_ALL"] = "C"
+    env.pop("LANGUAGE", None)
     if domov:
         env["GNUPGHOME"] = domov
     return subprocess.run(["gpg", "--batch", "--yes", "--no-tty", "--quiet", *args], input=vhod,
@@ -54,7 +59,7 @@ def _varna_pot(ime: str, predpone: tuple[str, ...]) -> str:
     s = p.as_posix()
     if s in ("", "."):
         raise NapakaZaupno("prazna pot v prekrivalu")
-    if not any(s.startswith(pr) for pr in predpone):
+    if not any(s.startswith(pr.rstrip("/") + "/") for pr in predpone):     # OO11: »packaging« ne dovoli »packaging-x/«
         raise NapakaZaupno("pot zunaj dovoljenih predpon")
     return s
 
@@ -114,7 +119,7 @@ def _odsifriraj_tok(vhod: Path, kljuc: str) -> bytes:
         r = _gpg(["--import"], domov, kljuc.encode("utf-8"))
         if r.returncode != 0:
             raise NapakaZaupno("uvoz kljuca ni uspel")        # izpisa gpg ne kazemo: lahko vsebuje dele kljuca
-        r = _gpg(["--decrypt", str(vhod)], domov)
+        r = _gpg(["--max-output", str(NAJVEC_IZHODA_GPG), "--decrypt", "--", str(vhod)], domov)
         if r.returncode != 0:
             raise NapakaZaupno("odsifriranje ni uspelo (napacen kljuc ali pokvarjena datoteka)")
         return r.stdout
@@ -173,7 +178,7 @@ def nepreberno(vhod: Path, kljuc: str | None = None) -> bool:
     try:
         if _gpg(["--import"], domov, kljuc.encode("utf-8")).returncode != 0:
             raise NapakaZaupno("uvoz kljuca ni uspel")
-        r = _gpg(["--decrypt", str(vhod)], domov)
+        r = _gpg(["--max-output", str(NAJVEC_IZHODA_GPG), "--decrypt", "--", str(vhod)], domov)
         return r.returncode != 0 and b"No secret key" in r.stderr and not r.stdout
     finally:
         try:
@@ -186,13 +191,13 @@ def nepreberno(vhod: Path, kljuc: str | None = None) -> bool:
 
 def sifriraj(vhod: Path, izhod: Path, prejemnik: str, domov: str | None = None) -> None:
     r = _gpg(["--trust-model", "always", "--compress-algo", "none", "-r", prejemnik, "-o", str(izhod),
-              "--encrypt", str(vhod)], domov)
+              "--encrypt", "--", str(vhod)], domov)
     if r.returncode != 0:
         raise NapakaZaupno("gpg --encrypt ni uspel (koda %d)" % r.returncode)
 
 
 def odsifriraj(vhod: Path, izhod: Path, domov: str | None = None) -> None:
-    r = _gpg(["-o", str(izhod), "--decrypt", str(vhod)], domov)
+    r = _gpg(["-o", str(izhod), "--decrypt", "--", str(vhod)], domov)
     if r.returncode != 0:
         raise NapakaZaupno("gpg --decrypt ni uspel (koda %d)" % r.returncode)
 

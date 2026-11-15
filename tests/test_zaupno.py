@@ -240,3 +240,39 @@ def test_nepreberno_loci_berljiv_izhod_od_nepreberljivega(tmp_path, kljuc, drug_
     assert zaupno.nepreberno(za_istega, kljuc=zasebni) is False
     (tmp_path / "c.gpg").write_bytes(b"to ni gpg")
     assert zaupno.nepreberno(tmp_path / "c.gpg", kljuc=zasebni) is False      # drug vzrok ni dokaz
+
+
+def test_bomba_stiskanja_se_ustavi_pri_meji_izhoda(tmp_path, kljuc, monkeypatch):
+    """OO5: majhna sifrirana datoteka, ki se razsiri v veliko vec, ne sme zapolniti pomnilnika (gpg --max-output)."""
+    domov, odtis, zasebni, _ = kljuc
+    monkeypatch.setattr(zaupno, "NAJVEC_IZHODA_GPG", 1_000_000)
+    izhod = tmp_path / "bomba.tar.gpg"
+    _surovo_sifrirano(domov, odtis, [("packaging/nic.bin", bytes(3_000_000), "datoteka")], izhod)
+    assert izhod.stat().st_size < 100_000                           # res je stisnjeno (3 MB ničel)
+    with pytest.raises(zaupno.NapakaZaupno):
+        zaupno.razpakiraj(izhod, tmp_path / "cilj", kljuc=zasebni)
+    assert not (tmp_path / "cilj" / "packaging").exists()
+
+
+def test_gpg_tece_v_c_lokali_ne_glede_na_jezik_sistema(monkeypatch):
+    """OO7: presoja v `nepreberno` temelji na angleskem besedilu gpg; podproces zato vedno dobi LC_ALL=C brez LANGUAGE."""
+    videno = {}
+
+    def lazni_zagon(ukaz, **kw):
+        videno.update(kw["env"])
+        return subprocess.CompletedProcess(ukaz, 0, b"", b"")
+
+    monkeypatch.setenv("LANG", "sl_SI.UTF-8")
+    monkeypatch.setenv("LC_ALL", "sl_SI.UTF-8")
+    monkeypatch.setenv("LANGUAGE", "sl")
+    monkeypatch.setattr(zaupno.subprocess, "run", lazni_zagon)
+    zaupno._gpg(["--version"], None)
+    assert videno["LC_ALL"] == "C"
+    assert "LANGUAGE" not in videno
+    assert "ZAUPNO_KLJUC" not in videno
+
+
+def test_predpona_brez_poslevnice_ne_dovoli_sorodne_mape():
+    assert zaupno._varna_pot("packaging/a.sh", ("packaging",)) == "packaging/a.sh"
+    with pytest.raises(zaupno.NapakaZaupno):
+        zaupno._varna_pot("packaging-zlo/a.sh", ("packaging",))
