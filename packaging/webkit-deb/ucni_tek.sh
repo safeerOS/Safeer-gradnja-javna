@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Ucni tek za PGO nasega WebKitGTK v paketih .deb: instrumentiran WebKit (zgradi.sh s SAFEER_WEBKIT_PGO=ucenje) pozene
+# Speedometer 3.1 (ista pripeta kopija in packaging/webkit/pgo_trening.py kot ucni tek Flatpaka) pod Xvfb.
+#
+#   ucni_tek.sh PREDPONA MAPA_PROFRAW [pgo|bolt|preveri]   npr. ucni_tek.sh /usr/lib/safeer-webkit build/pgo/profraw
+#
+# Spletni proces tece brez peskovnika samo v tem teku (lokalna vsebina): podeduje LLVM_PROFILE_FILE in ob SIGTERM
+# zapise profil; %m loci knjiznici (libwebkitgtk, libjavascriptcoregtk) v istem procesu.
+# bolt (packaging/webkit-deb/bolt.sh): isti tek s knjiznicama, instrumentiranima z llvm-bolt (bolt_trening.py: procesi
+# koncajo normalno in zapisejo .fdata v mapo, doloceno ob instrumentaciji). preveri: isti tek z optimiziranima
+# knjiznicama, uspe samo z veljavnim rezultatom Speedometra.
+set -euo pipefail
+KOREN="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PREDPONA="${1:?PREDPONA}"
+P="$(mkdir -p "${2:?MAPA_PROFRAW}" && cd "$2" && pwd)"
+NACIN="${3:-pgo}"
+case "$NACIN" in pgo|bolt|preveri) ;; *) echo "ucni_tek.sh: nacin je pgo, bolt ali preveri" >&2; exit 2 ;; esac
+SPEEDOMETER="$KOREN/build/pgo/speedometer"
+if [ ! -d "$SPEEDOMETER/.git" ]; then
+    git clone -q -b release/3.1 https://github.com/WebKit/Speedometer.git "$SPEEDOMETER"
+fi
+# Nadaljevanje v vsebniku (root) nad mapo, ki jo je naredil drug uporabnik: git javi »dubious ownership« in ucni tek
+# pade (10. 11. 2026: jsc je ostal brez BOLT). Dovoljenje velja samo za to mapo in ta ukaz.
+git -c safe.directory="$SPEEDOMETER" -C "$SPEEDOMETER" checkout -q 1386415be8fef2f6b6bbdbe1828872471c5d802a
+python3 -m http.server 8123 --bind 127.0.0.1 --directory "$SPEEDOMETER" >/dev/null 2>&1 &
+SRV=$!
+trap 'kill "$SRV" 2>/dev/null || true' EXIT
+sleep 2
+TRENING="$KOREN/packaging/webkit/pgo_trening.py"
+OKOLJE=(GI_TYPELIB_PATH="$PREDPONA/lib/girepository-1.0" WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1)
+if [ "$NACIN" = pgo ]; then
+    OKOLJE+=(LLVM_PROFILE_FILE="$P/%p-%m.profraw")
+else
+    TRENING="$KOREN/packaging/webkit-deb/bolt_trening.py"
+fi
+env "${OKOLJE[@]}" xvfb-run -a -s "-screen 0 1920x1080x24" dbus-run-session -- \
+    python3 "$TRENING" "http://127.0.0.1:8123/?startAutomatically&iterationCount=5" 150
+for _ in $(seq 60); do pgrep -f 'WebKit(Network|Web)Process' >/dev/null || break; sleep 1; done
+ls -l "$P"
+if [ "$NACIN" = pgo ]; then
+    [ "$(find "$P" -name '*.profraw' -size +1k | wc -l)" -ge 2 ] || { echo "ucni_tek.sh: premalo profilov v $P" >&2; exit 1; }
+fi
